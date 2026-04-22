@@ -5,7 +5,7 @@
 }:
 
 writeShellApplication {
-  name = "my-script";
+  name = "wicf";
 
   runtimeInputs = [
     bpftrace
