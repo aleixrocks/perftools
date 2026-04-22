@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+run() {
+	cmd=$@
+	sleep 5
+	echo "starting command!"
+	exec $cmd
+}
+
+
+if [ $# -eq 0 ]; then
+	>&2 echo "usage: nthr <command> <command_args>"
+	exit 1
+fi
+
+if [ "$EUID" -eq 0 ]; then
+	echo "Do not run me as root! I will run sudo when needed."
+	exit 1
+fi
+
+cmd=$@
+(run $cmd ) &
+pid=$!
+
+tmpfile=$(mktemp /tmp/aff-log.XXXXXX)
+
+sudo -E $(which bpftrace) -e '
+
+tracepoint:sched:sched_process_exec /pid == $1 && !@init/ {
+	@init = 1;
+}
+
+tracepoint:syscalls:sys_enter_sched_setaffinity /tid == $1 && @init/ {
+	printf("%d:%d:%rx\n", tid,args->pid,buf(args->user_mask_ptr, args->len));
+}
+
+tracepoint:sched:sched_wakeup_new /pid == $1 && @init/ {
+	printf("%d: new thread %d\n", tid, args->pid);
+	@cnt = count();
+}
+
+tracepoint:sched:sched_process_exit /tid == $1 && @init/ {
+	exit()
+}
+
+END {
+	clear(@init);
+}
+' $pid > $tmpfile
+
+echo $tmpfile
+
+python3 <<EOF
+#!/usr/bin/env python3
+import struct
+import sys
+
+
+def bufToBitmask(buf, typesize):
+	l = []
+	for long in buf:
+		for i in range(typesize * 8):
+			l.append((long>>i) & 1)
+	return l
+
+
+def bitmaskToIndex(bitmask):
+	l = []
+	i = 0
+	for b in bitmask:
+		if b == 1:
+			l.append(i)
+		elif b != 0:
+			sys.exit("invalid bitmask")
+		i += 1
+	return l
+
+
+filename="$tmpfile"
+
+longsize = struct.calcsize("l")
+with open(filename) as file:
+	for line in file:
+		if line.strip() == "":
+			continue
+		elif line.startswith("Attaching "):
+			continue
+		elif len(line.split(":")) != 3:
+			print(line)
+			continue
+
+		raw = line.split(":")
+		tid = raw[0]
+		pid = raw[1]
+		val = raw[2]
+
+		val = val.replace('\\\x',' ').strip()
+		val = bytes.fromhex(val)
+
+		nlong = int(len(val)/longsize)
+		format = str(nlong) + "l"
+		affinity = struct.unpack(format, val)
+
+		bitmask = bufToBitmask(affinity, longsize)
+		cores = bitmaskToIndex(bitmask)
+		print(str(tid) + ":sched_setaffinity(" + str(pid) + "," + str(cores) + ")")
+EOF
+
+
+wait $pid

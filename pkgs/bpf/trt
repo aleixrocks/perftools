@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+usage() {
+	>&2 echo "Output Thread RunTime (trt) stats for the calling proc in us"
+	>&2 echo "usage: trt [-h] [-t <threashold>] [--] <command> <command_args>"
+	>&2 echo "   -h|--help: print this help"
+	>&2 echo "   -t|--threshold: set the minimum runtime to count"
+	>&2 echo "   -d|--histogram: Show per-thread histogram distribution"
+	exit 1
+}
+
+run() {
+	cmd=$@
+	sleep 5
+	echo "starting command!"
+	exec $cmd
+}
+
+log=./out
+
+if [ $# -eq 0 ]; then
+	usage;
+fi
+
+if [ "$EUID" -eq 0 ]; then
+	echo "Do not run me as root! I will run sudo when needed."
+	exit 1
+fi
+
+# default args
+trh=0
+hist=0
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-t|--treshold)
+			trh=$2
+			shift # past argument
+			shift # past value
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		-d|--histogram)
+			hist=1
+			shift
+			;;
+		--)
+			shift
+			break;
+			;;
+		-*|--*)
+			echo "Unknown option $1"
+			exit 1
+			;;
+		*)
+			break;
+	esac
+done
+
+tmpfile=$(mktemp /tmp/wtcf-log.XXXXXX)
+cmd=$@
+
+echo "raw data at: $tmpfile"
+
+(run $cmd ) &
+pid=$!
+
+sudo -E $(which bpftrace) -e '
+
+tracepoint:sched:sched_process_exec /pid == $1 && !@init/ {
+	@init = 1;
+}
+
+tracepoint:sched:sched_switch /pid == $1 && @init/ {
+	@start[args.next_pid] = nsecs;
+	if (pid == $1 && @start[tid]) {
+		$rt = (nsecs - @start[tid])/1000; //us
+		if ($rt < '$trh') {
+			return;
+		}
+		@rtime[tid] += $rt;
+		@ptime[tid] += $rt * $rt;
+		@n[tid] += 1;
+		if (@max[tid] < $rt) {
+			@max[tid] = $rt;
+		}
+		if (!@min[tid]) {
+			@min[tid] = $rt;
+		} else if (@min[tid] > $rt) {
+			@min[tid] = $rt;
+		}
+
+		if ('$hist') {
+			@hist[tid] = hist($rt);
+		}
+		@start[tid] = 0;
+	}
+}
+
+tracepoint:sched:sched_process_exit /tid == $1 && @init/ {
+	exit();
+}
+
+END {
+	if (!'$hist') {
+		printf("tid,time,mean,min,max,pow,n\n");
+		for ($kv : @rtime) {
+			$tid = $kv.0;
+			$time = $kv.1;
+			$n = @n[$tid];
+			$mean = $time/$n;
+			$pow = @ptime[$tid];
+			$max = @max[$tid];
+			$min = @min[$tid];
+			printf("%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+				$tid, $time, $mean, $min, $max, $pow, $n
+			);
+		}
+	}
+	clear(@init);
+	clear(@start);
+	clear(@rtime);
+	clear(@ptime);
+	clear(@max);
+	clear(@min);
+	clear(@n);
+}
+' $pid | tee $tmpfile >/dev/null
+
+wait $pid
+
+if [ $hist -eq 1 ]; then
+	cat $tmpfile
+	rm -f $tmpfile
+	exit 0;
+fi
+
+echo "parsing bpf data..."
+
+sed -i '1d' $tmpfile
+
+python3 <<EOF | column -t -s,
+#!/usr/bin/env python3
+import sys
+import csv
+import math
+
+filename="$tmpfile"
+
+print('tid,time,mean,min,max,std,n')
+with open(filename) as file:
+	reader = csv.DictReader(file)
+	for l in reader:
+		tid  = int(l["tid"])
+		time = int(l["time"])
+		mean = int(l["mean"])
+		min  = int(l["min"])
+		max  = int(l["max"])
+		pow  = int(l["pow"])
+		n    = int(l["n"])
+		std  = math.sqrt((pow / n) - (mean * mean))
+		print(f'{tid},{time},{mean},{min},{max},{std:.2f},{n}')
+EOF
+
+rm -f $tmpfile
+

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+run() {
+	cmd=$@
+	sleep 5
+	echo "starting command!"
+	exec $cmd
+}
+
+log=./out
+
+if [ $# -eq 0 ]; then
+	>&2 echo "usage: nthr <command> <command_args>"
+	exit 1
+fi
+
+if [ "$EUID" -eq 0 ]; then
+	echo "Do not run me as root! I will run sudo when needed."
+	exit 1
+fi
+
+tmpfile=$(mktemp /tmp/wtcf-log.XXXXXX)
+
+cmd=$@
+(run $cmd ) &
+pid=$!
+
+sudo -E $(which bpftrace) -e '
+
+tracepoint:sched:sched_process_exec /pid == $1 && !@init/ {
+	@init = 1;
+}
+
+tracepoint:sched:sched_wakeup_new /pid == $1 && @init/ {
+	print(ustack)
+}
+
+tracepoint:sched:sched_process_exit /tid == $1 && @init/ {
+	exit();
+}
+
+END {
+	clear(@init);
+}
+' $pid > $tmpfile
+
+wait $pid
+
+echo "parsing bpf data..."
+
+sed -i '1d' $tmpfile
+
+python3 <<EOF
+#!/usr/bin/env python3
+import sys
+from collections import defaultdict
+
+
+filename="$tmpfile"
+dic = defaultdict(int)
+
+ss=""
+with open(filename) as file:
+	for line in file:
+		if line.strip():
+			ss = ss + line
+		elif ss:
+			dic[ss] += 1
+			ss = ""
+
+
+for key, val in sorted(dic.items(), key=lambda item: item[1]):
+	print(val)
+	print(key)
+	print("\n")
+EOF
+
+rm -f $tmpfile

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+
+run() {
+	cmd=$@
+	sleep 10
+	echo "starting command!"
+	exec $cmd
+}
+
+
+if [ $# -eq 0 ]; then
+	>&2 echo "usage: cslat <command> <command_args>"
+	exit 1
+fi
+
+if [ "$EUID" -eq 0 ]; then
+	echo "Do not run me as root! I will run sudo when needed."
+	exit 1
+fi
+
+cmd=$@
+
+# find the nosv library path in the provided executable
+nosv=$(ldd ${cmd%% *} |awk '{if ($1=="libnosv.so.0") { print $3;}}')
+if [ ! -e $nosv ]; then
+	>&2 echo "Error: cannot find nosv library in binary"
+	exit 1
+fi
+
+# run the command with an initial delay
+(run $cmd ) &
+pid=$!
+
+# create a temporal file to store the results
+tmpfile=$(mktemp /tmp/aff-log.XXXXXX)
+
+# attach the bpf program
+sudo -E $(which bpftrace) -f json -e '
+tracepoint:sched:sched_process_exec /pid == $1 && !@init/ {
+	@init = 1;
+}
+
+usdt:'$nosv':nosv:worker_wake_start /pid == $1 && @init/ {
+	@cslat[tid] = elapsed
+}
+
+tracepoint:sched:sched_switch /pid == $1 && @init/ {
+	// Keep track of the time a thread between worker_wake_start and
+	// worker_wake_end is not running and substract that time from the
+	// context-switch time.
+
+	if (@cslat[args.prev_pid]) {
+		@cslat_skip[args.prev_pid] = elapsed;
+	}
+
+	if (@cslat[args.next_pid] && @cslat_skip[args.next_pid]) {
+		$time_off_core = elapsed - @cslat_skip[args.next_pid];
+		@cslat[args.next_pid] += $time_off_core;
+	}
+}
+
+usdt:'$nosv':nosv:worker_wake_end /pid == $1 && @init/ {
+	if (@cslat[tid]) {
+		$time = (elapsed - @cslat[tid]);
+		@cslat[tid] = 0;
+		@average=avg($time);
+		@maxlat=max($time);
+		@minlat=min($time);
+		@histogram=lhist($time, 0, 50000, 1000);
+	}
+}
+
+tracepoint:sched:sched_process_exit /tid == $1 && @init/ {
+	exit()
+}
+
+END {
+	clear(@init);
+	clear(@cslat);
+	clear(@cslat_skip);
+}
+' $pid | tee $tmpfile
+
+# wait for the process to finish
+wait $pid
+
+# process the bpf results
+echo "raw results: $tmpfile"
+
+# create barplot
+python3 <<EOF
+#!/usr/bin/env python3
+import json
+import sys
+import pandas as pd
+import seaborn as sns
+
+filename="$tmpfile"
+
+# read json strings and convert them in a single json objects
+data = {}
+with open(filename) as file:
+	for line in file:
+		if not line.strip():
+			continue
+		obj = json.loads(line);
+		# Merge individual jsons in a single one
+		data[obj["type"]] = obj["data"]
+
+# Convert json to dataframe
+hist = data["hist"]["@histogram"]
+df = pd.DataFrame(hist)
+
+# Format data
+df["min"] //= 1000
+df["max"] = (df["max"] + 1) // 1000
+df = df.fillna(float('inf'))
+
+# Create x label
+df["label"] = df.apply(lambda row: f'[{int(row["min"])}, {(row["max"]):.0f}]', axis=1)
+
+# Plot
+g = sns.catplot(
+    data = df, x = "label", y = "count", kind = "bar",
+    aspect = 1.8
+)
+g.set(xlabel="Latency (us)", ylabel="Count", title="nOS-V Context-Switch histogram")
+g.set_xticklabels(rotation=90)
+g.fig.savefig("hist.png", bbox_inches="tight")
+g.fig.clf()
+EOF
