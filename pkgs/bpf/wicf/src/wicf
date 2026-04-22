@@ -8,7 +8,7 @@ run() {
 }
 
 if [ $# -eq 0 ]; then
-	>&2 echo "usage: nthr <what> <command> <command_args>"
+	>&2 echo "usage: wicf <probe> <command>"
 	>&2 echo "works best with disabled ASLR, i.e."
 	>&2 echo "  echo 0 | sudo tee /proc/sys/kernel/randomize_va_space"
 	>&2 echo "or"
