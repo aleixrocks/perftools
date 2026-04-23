@@ -19,7 +19,6 @@
       pthtree = p.callPackage pkgs/pthtree {};
       setaff = p.callPackage pkgs/setaff {};
       wicf = p.callPackage pkgs/bpf/wicf {};
-      inherit (p) perf bpftrace;
     };
   in {
     legacyPackages.x86_64-linux = mkPackages pkgs;
