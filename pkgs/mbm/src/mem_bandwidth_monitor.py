@@ -17,36 +17,45 @@ import threading
 import shlex
 
 class MemoryBandwidthMonitor:
-    def __init__(self, interval=1.0, duration=None, command=None, title=None):
+    def __init__(self, interval=1.0, duration=None, command=None, title=None,
+                 monitor_cpu=False, monitor_io=False):
         """
         Initialize the memory bandwidth monitor
-        
+
         Args:
             interval: Sampling interval in seconds
             duration: Total duration to monitor in seconds (None for infinite)
             command: Command to run and monitor (string or list)
             title: Custom title for the plot (None for auto-generated)
+            monitor_cpu: If True, also monitor total CPU usage via /proc/stat
+            monitor_io: If True, also monitor disk I/O via /proc/diskstats
         """
         self.interval = interval
         self.duration = duration
         self.command = command
         self.title = title
+        self.monitor_cpu = monitor_cpu
+        self.monitor_io = monitor_io
         self.timestamps = []
         self.read_bandwidth = []  # GB/s
         self.write_bandwidth = []  # GB/s
         self.total_bandwidth = []  # GB/s
+        self.cpu_usage = []  # percentage (0-100)
+        self.io_read = []   # MB/s
+        self.io_write = []  # MB/s
         self.running = True
         self.command_process = None
         self.command_returncode = None
         self.perf_process = None
-        
+
         # Cache line size in bytes
         self.cache_line_size = 64
-        
+
         # Memory bandwidth events
         self.read_event = None
         self.write_event = None
         self.events_detected = False
+
         
     def check_perf_availability(self):
         """Check if perf is available"""
@@ -210,6 +219,9 @@ class MemoryBandwidthMonitor:
             'perf', 'stat',
             '-e', self.read_event,
             '-e', self.write_event,
+        ]
+
+        cmd += [
             '-a',  # System-wide
             '-I', str(interval_ms),  # Print stats every interval_ms milliseconds
             '-x', ',',  # CSV output
@@ -235,38 +247,38 @@ class MemoryBandwidthMonitor:
         """
         Parse a single line of perf output
         Returns (timestamp, event_type, count) where event_type is 'read', 'write', or None
-        
+
         Format: timestamp,count,unit,event,runtime,pct
         Example: 1.001234567,12345,,LLC-loads,1001234567,100.00
         Example: 1.001234567,12345,,unc_m_cas_count.rd,1001234567,100.00
         """
         if not line.strip():
             return None, None, 0
-        
+
         parts = line.split(',')
         if len(parts) < 4:
             return None, None, 0
-        
+
         # parts[0] = timestamp
         # parts[1] = count
         # parts[3] = event name
-        
+
         timestamp_str = parts[0].strip()
         value_str = parts[1].strip()
         event_str = parts[3].lower() if len(parts) > 3 else ''
-        
+
         if not value_str or not value_str[0].isdigit():
             return None, None, 0
-        
+
         try:
             timestamp = float(timestamp_str)
             count = int(value_str)
-            
+
             # Normalize event strings for matching (remove slashes and underscores)
             event_str_normalized = event_str.replace('/', '').replace('_', '')
             read_event_normalized = self.read_event.lower().replace('/', '').replace('_', '')
             write_event_normalized = self.write_event.lower().replace('/', '').replace('_', '')
-            
+
             # Determine if this is read or write event
             if read_event_normalized in event_str_normalized:
                 return timestamp, 'read', count
@@ -274,10 +286,61 @@ class MemoryBandwidthMonitor:
                 return timestamp, 'write', count
             else:
                 return None, None, 0
-                
+
         except ValueError:
             return None, None, 0
     
+    @staticmethod
+    def _read_cpu_times():
+        """Read aggregate CPU times from /proc/stat. Returns (busy, total) in jiffies."""
+        with open('/proc/stat', 'r') as f:
+            line = f.readline()  # first line: "cpu  user nice system idle iowait irq softirq steal ..."
+        parts = line.split()
+        times = [int(x) for x in parts[1:]]
+        idle = times[3] + (times[4] if len(times) > 4 else 0)  # idle + iowait
+        total = sum(times)
+        return total - idle, total
+
+    @staticmethod
+    def _read_io_stats():
+        """Read aggregate disk I/O from /proc/diskstats. Returns (sectors_read, sectors_written).
+
+        Only counts whole-disk devices (no partition numbers) to avoid double-counting.
+        Sector size is 512 bytes.
+        """
+        sectors_read = 0
+        sectors_written = 0
+        with open('/proc/diskstats', 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 14:
+                    continue
+                dev_name = parts[2]
+                # Skip partitions (names ending with a digit preceded by a letter,
+                # like sda1, nvme0n1p1). Keep whole disks like sda, nvme0n1.
+                # A simple heuristic: skip if last char is digit AND second-to-last
+                # is also digit or 'p' (partition indicator for nvme).
+                # More reliable: only count devices that have 0 in field 0 (minor) — no,
+                # let's just skip entries whose name matches common partition patterns.
+                # Simplest correct approach: skip if name ends with a digit and contains
+                # a 'p' partition separator or the preceding char is a letter.
+                if len(dev_name) > 1 and dev_name[-1].isdigit():
+                    # Check for nvme partition: nvme0n1p1
+                    if 'p' in dev_name and dev_name[-1].isdigit():
+                        idx = dev_name.rfind('p')
+                        if idx > 0 and dev_name[idx+1:].isdigit():
+                            continue
+                    # Check for sd/hd/vd partition: sda1
+                    elif dev_name[-1].isdigit() and len(dev_name) >= 4:
+                        prefix = dev_name.rstrip('0123456789')
+                        if prefix != dev_name:  # has trailing digits
+                            # If prefix ends with a letter, it's a partition
+                            if prefix and prefix[-1].isalpha():
+                                continue
+                sectors_read += int(parts[5])    # sectors read
+                sectors_written += int(parts[9]) # sectors written
+        return sectors_read, sectors_written
+
     def signal_handler(self, signum, frame):
         """Handle Ctrl+C gracefully"""
         print("\nStopping monitoring...")
@@ -364,44 +427,55 @@ class MemoryBandwidthMonitor:
             print(f"Duration: {self.duration}s")
         else:
             print("Duration: Press Ctrl+C to stop")
-        print("\nTime\t\tRead (GB/s)\tWrite (GB/s)\tTotal (GB/s)")
-        print("-" * 70)
-        
+        print()
+
         start_time = time.time()
         last_timestamp = None
         current_read_count = 0
         current_write_count = 0
-        sample_complete = False
-        
+
+        if self.monitor_cpu:
+            prev_busy, prev_total = self._read_cpu_times()
+        if self.monitor_io:
+            prev_io_read, prev_io_write = self._read_io_stats()
+
+        header = "Time\t\tRead (GB/s)\tWrite (GB/s)\tTotal (GB/s)"
+        if self.monitor_cpu:
+            header += "\tCPU (%)"
+        if self.monitor_io:
+            header += "\tIOR (MB/s)\tIOW (MB/s)"
+        print(header)
+        print("-" * (80 + (16 if self.monitor_cpu else 0) + (24 if self.monitor_io else 0)))
+
         # Read from perf stderr in real-time
         while self.running:
             # Check if we've reached duration limit
             if self.duration and (time.time() - start_time) >= self.duration:
                 break
-            
+
             # Check if command has finished
             if self.command and command_thread and not command_thread.is_alive():
                 print("\nCommand has finished, collecting final samples...")
                 time.sleep(self.interval + 0.5)  # Give perf time to output last interval
                 break
-            
+
             # Check if perf process died
             if self.perf_process.poll() is not None:
                 print("\nPerf process terminated unexpectedly")
                 break
-            
+
             # Read lines from perf stderr
             try:
                 # Use select to avoid blocking indefinitely
                 ready, _, _ = select.select([self.perf_process.stderr], [], [], 0.1)
-                
+
                 if ready:
                     line = self.perf_process.stderr.readline()
                     if not line:
                         break
-                    
-                    timestamp, event_type, count = self.parse_perf_line(line)
-                    
+
+                    timestamp, event_type, value = self.parse_perf_line(line)
+
                     if timestamp is not None and event_type is not None:
                         # New timestamp means new sample period
                         if last_timestamp is not None and timestamp != last_timestamp:
@@ -410,27 +484,48 @@ class MemoryBandwidthMonitor:
                                 read_bw = (current_read_count * self.cache_line_size) / self.interval / 1e9
                                 write_bw = (current_write_count * self.cache_line_size) / self.interval / 1e9
                                 total_bw = read_bw + write_bw
-                                
+
                                 current_time = time.time() - start_time
                                 self.timestamps.append(current_time)
                                 self.read_bandwidth.append(read_bw)
                                 self.write_bandwidth.append(write_bw)
                                 self.total_bandwidth.append(total_bw)
-                                
-                                print(f"{current_time:6.1f}s\t\t{read_bw:6.2f}\t\t{write_bw:6.2f}\t\t{total_bw:6.2f}")
-                            
+
+                                line_out = f"{current_time:6.1f}s\t\t{read_bw:6.2f}\t\t{write_bw:6.2f}\t\t{total_bw:6.2f}"
+
+                                if self.monitor_cpu:
+                                    busy, total = self._read_cpu_times()
+                                    d_busy = busy - prev_busy
+                                    d_total = total - prev_total
+                                    cpu_pct = 100.0 * d_busy / d_total if d_total > 0 else 0.0
+                                    prev_busy, prev_total = busy, total
+                                    self.cpu_usage.append(cpu_pct)
+                                    line_out += f"\t\t{cpu_pct:5.1f}"
+
+                                if self.monitor_io:
+                                    io_r, io_w = self._read_io_stats()
+                                    # sectors are 512 bytes; convert to MB/s
+                                    io_read_mbs = (io_r - prev_io_read) * 512 / self.interval / 1e6
+                                    io_write_mbs = (io_w - prev_io_write) * 512 / self.interval / 1e6
+                                    prev_io_read, prev_io_write = io_r, io_w
+                                    self.io_read.append(io_read_mbs)
+                                    self.io_write.append(io_write_mbs)
+                                    line_out += f"\t\t{io_read_mbs:7.1f}\t\t{io_write_mbs:7.1f}"
+
+                                print(line_out)
+
                             # Reset counters for new sample
                             current_read_count = 0
                             current_write_count = 0
-                        
+
                         # Accumulate counts for this timestamp
                         if event_type == 'read':
-                            current_read_count = count
+                            current_read_count = value
                         elif event_type == 'write':
-                            current_write_count = count
-                        
+                            current_write_count = value
+
                         last_timestamp = timestamp
-                
+
             except Exception as e:
                 print(f"Error reading from perf: {e}")
                 break
@@ -540,13 +635,29 @@ class MemoryBandwidthMonitor:
         if len(self.timestamps) == 0:
             print("No data to save!")
             return
-        
+
+        has_cpu = len(self.cpu_usage) > 0
+        has_io = len(self.io_read) > 0
+
         with open(output_file, 'w') as f:
-            f.write("Time(s),Read(GB/s),Write(GB/s),Total(GB/s)\n")
-            for t, r, w, total in zip(self.timestamps, self.read_bandwidth, 
-                                      self.write_bandwidth, self.total_bandwidth):
-                f.write(f"{t:.2f},{r:.4f},{w:.4f},{total:.4f}\n")
-        
+            header = "Time(s),Read(GB/s),Write(GB/s),Total(GB/s)"
+            if has_cpu:
+                header += ",CPU(%)"
+            if has_io:
+                header += ",IORead(MB/s),IOWrite(MB/s)"
+            f.write(header + "\n")
+
+            for i in range(len(self.timestamps)):
+                line = (f"{self.timestamps[i]:.2f},"
+                        f"{self.read_bandwidth[i]:.4f},"
+                        f"{self.write_bandwidth[i]:.4f},"
+                        f"{self.total_bandwidth[i]:.4f}")
+                if has_cpu:
+                    line += f",{self.cpu_usage[i]:.2f}"
+                if has_io:
+                    line += f",{self.io_read[i]:.2f},{self.io_write[i]:.2f}"
+                f.write(line + "\n")
+
         print(f"Data saved to: {output_file}")
 
 
@@ -591,6 +702,10 @@ Note: Use -- separator when your command has options starting with - to avoid am
                        help='Custom title for the plot (default: auto-generated)')
     parser.add_argument('--no-plot', action='store_true',
                        help='Skip displaying the plot interactively')
+    parser.add_argument('--cpu', action='store_true',
+                       help='Also monitor total CPU usage (via /proc/stat)')
+    parser.add_argument('--io', action='store_true',
+                       help='Also monitor disk I/O throughput (via /proc/diskstats)')
     parser.add_argument('command', nargs='*',
                        help='Command and arguments to run (optional)')
     
@@ -601,10 +716,12 @@ Note: Use -- separator when your command has options starting with - to avoid am
     
     # Create monitor
     monitor = MemoryBandwidthMonitor(
-        interval=args.interval, 
+        interval=args.interval,
         duration=args.duration,
         command=command,
-        title=args.title
+        title=args.title,
+        monitor_cpu=args.cpu,
+        monitor_io=args.io
     )
     
     # Check perf availability
@@ -656,6 +773,19 @@ Note: Use -- separator when your command has options starting with - to avoid am
         print(f"  Median:          {np.median(monitor.total_bandwidth):.2f} GB/s")
         print(f"  Min:             {np.min(monitor.total_bandwidth):.2f} GB/s")
         print(f"  Max:             {np.max(monitor.total_bandwidth):.2f} GB/s")
+        if len(monitor.cpu_usage) > 0:
+            print(f"\nCPU Usage:")
+            print(f"  Average:         {np.mean(monitor.cpu_usage):.1f} %")
+            print(f"  Median:          {np.median(monitor.cpu_usage):.1f} %")
+            print(f"  Min:             {np.min(monitor.cpu_usage):.1f} %")
+            print(f"  Max:             {np.max(monitor.cpu_usage):.1f} %")
+        if len(monitor.io_read) > 0:
+            print(f"\nDisk I/O Read:")
+            print(f"  Average:         {np.mean(monitor.io_read):.1f} MB/s")
+            print(f"  Max:             {np.max(monitor.io_read):.1f} MB/s")
+            print(f"\nDisk I/O Write:")
+            print(f"  Average:         {np.mean(monitor.io_write):.1f} MB/s")
+            print(f"  Max:             {np.max(monitor.io_write):.1f} MB/s")
         print("="*70)
         
         # Add note about measurement type

@@ -29,31 +29,55 @@ class BandwidthPlotter:
             reads = []
             writes = []
             totals = []
-            
+            cpus = []
+            io_reads = []
+            io_writes = []
+
             with open(csv_file, 'r') as f:
                 reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or []
+                has_cpu = 'CPU(%)' in fieldnames
+                has_io = 'IORead(MB/s)' in fieldnames
                 for row in reader:
                     times.append(float(row['Time(s)']))
                     reads.append(float(row['Read(GB/s)']))
                     writes.append(float(row['Write(GB/s)']))
                     totals.append(float(row['Total(GB/s)']))
-            
+                    if has_cpu:
+                        cpus.append(float(row['CPU(%)']))
+                    if has_io:
+                        io_reads.append(float(row['IORead(MB/s)']))
+                        io_writes.append(float(row['IOWrite(MB/s)']))
+
             if not times:
                 print(f"Warning: No data found in {csv_file}")
                 return False
-            
-            self.datasets.append({
+
+            dataset = {
                 'time': np.array(times),
                 'read': np.array(reads),
                 'write': np.array(writes),
                 'total': np.array(totals),
                 'file': csv_file
-            })
+            }
+            if cpus:
+                dataset['cpu'] = np.array(cpus)
+            if io_reads:
+                dataset['io_read'] = np.array(io_reads)
+                dataset['io_write'] = np.array(io_writes)
+
+            self.datasets.append(dataset)
             self.labels.append(label)
-            
-            print(f"Loaded {len(times)} samples from {csv_file}")
+
+            extras = []
+            if cpus:
+                extras.append("CPU")
+            if io_reads:
+                extras.append("I/O")
+            extra = f" (with {', '.join(extras)} data)" if extras else ""
+            print(f"Loaded {len(times)} samples from {csv_file}{extra}")
             return True
-            
+
         except FileNotFoundError:
             print(f"Error: File not found: {csv_file}")
             return False
@@ -91,15 +115,40 @@ class BandwidthPlotter:
             print("Error: No data to plot!")
             return
         
-        # Determine number of subplots based on plot_type
-        if plot_type == 'all':
-            default_figsize = (14, 12)
-            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=figsize if figsize else default_figsize)
-            axes = [ax1, ax2, ax3]
+        # Check if any dataset has CPU or I/O data
+        has_any_cpu = any('cpu' in d for d in self.datasets)
+        has_any_io = any('io_read' in d for d in self.datasets)
+
+        # Determine number of subplots based on plot_type and extra data
+        n_bw = 3 if plot_type == 'all' else 1
+        n_extra = (1 if has_any_cpu else 0) + (1 if has_any_io else 0)
+        n_rows = n_bw + n_extra
+
+        extra_height = 4 * n_extra
+        base_height = 12 if plot_type == 'all' else 6
+        default_figsize = (14, base_height + extra_height)
+
+        if n_extra > 0:
+            height_ratios = [3] * n_bw + [2] * n_extra
+            fig, all_axes = plt.subplots(n_rows, 1, figsize=figsize if figsize else default_figsize,
+                                         gridspec_kw={'height_ratios': height_ratios})
         else:
-            default_figsize = (14, 6)
-            fig, ax = plt.subplots(1, 1, figsize=figsize if figsize else default_figsize)
-            axes = [ax]
+            fig, all_axes = plt.subplots(n_rows, 1, figsize=figsize if figsize else default_figsize)
+
+        if n_rows == 1:
+            all_axes = [all_axes]
+        axes = list(all_axes[:n_bw])
+
+        # Assign extra axes
+        extra_idx = n_bw
+        cpu_ax = None
+        io_ax = None
+        if has_any_cpu:
+            cpu_ax = all_axes[extra_idx]
+            extra_idx += 1
+        if has_any_io:
+            io_ax = all_axes[extra_idx]
+            extra_idx += 1
         
         # Color palette - use custom if provided, otherwise use default
         if colors:
@@ -278,14 +327,61 @@ class BandwidthPlotter:
             if zoom_range:
                 add_zoom_inset(ax, self.datasets, self.labels, color_list, linestyle_list, 'write')
         
+        # Plot CPU usage subplot if data is available
+        if cpu_ax is not None:
+            for data, label, color, linestyle in zip(self.datasets, self.labels, color_list, linestyle_list):
+                if 'cpu' in data:
+                    cpu_ax.plot(data['time'], data['cpu'],
+                               label=label, linewidth=2, color=color, linestyle=linestyle, alpha=0.8)
+
+            cpu_ax.set_xlabel('Time (seconds)', fontsize=fontsize)
+            cpu_ax.set_ylabel('CPU Usage (%)', fontsize=fontsize)
+            cpu_ax.set_ylim(0, 105)
+            cpu_ax.tick_params(labelsize=fontsize*0.92)
+            cpu_ax.grid(True, alpha=0.3)
+            if not no_titles:
+                cpu_ax.set_title('CPU Usage', fontsize=fontsize*1.17, fontweight='bold')
+
+            if not no_legend:
+                if isinstance(legend_loc, tuple):
+                    cpu_ax.legend(loc=legend_loc, fontsize=fontsize*0.83, ncol=legend_ncol,
+                                 bbox_to_anchor=legend_loc, bbox_transform=cpu_ax.transAxes)
+                else:
+                    cpu_ax.legend(loc=legend_loc, fontsize=fontsize*0.83, ncol=legend_ncol)
+
+        # Plot I/O throughput subplot if data is available
+        if io_ax is not None:
+            for data, label, color, linestyle in zip(self.datasets, self.labels, color_list, linestyle_list):
+                if 'io_read' in data:
+                    io_ax.plot(data['time'], data['io_read'],
+                               label=f'{label} read', linewidth=2, color=color,
+                               linestyle=linestyle, alpha=0.8)
+                    io_ax.plot(data['time'], data['io_write'],
+                               label=f'{label} write', linewidth=2, color=color,
+                               linestyle='--' if linestyle == '-' else ':', alpha=0.6)
+
+            io_ax.set_xlabel('Time (seconds)', fontsize=fontsize)
+            io_ax.set_ylabel('I/O Throughput (MB/s)', fontsize=fontsize)
+            io_ax.tick_params(labelsize=fontsize*0.92)
+            io_ax.grid(True, alpha=0.3)
+            if not no_titles:
+                io_ax.set_title('Disk I/O', fontsize=fontsize*1.17, fontweight='bold')
+
+            if not no_legend:
+                if isinstance(legend_loc, tuple):
+                    io_ax.legend(loc=legend_loc, fontsize=fontsize*0.83, ncol=legend_ncol,
+                                 bbox_to_anchor=legend_loc, bbox_transform=io_ax.transAxes)
+                else:
+                    io_ax.legend(loc=legend_loc, fontsize=fontsize*0.83, ncol=legend_ncol)
+
         plt.tight_layout(rect=[0, 0, 1, 0.99])  # Leave space for suptitle
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         print(f"\nPlot saved to: {output_file}")
-        
+
         # Export standalone legend if requested
         if export_legend:
             self._export_legend(export_legend, fontsize, legend_ncol, colors, linestyles)
-        
+
         if show:
             plt.show()
     
@@ -364,6 +460,14 @@ class BandwidthPlotter:
             print(f"  Total BW (avg):  {np.mean(data['total']):.2f} GB/s")
             print(f"  Total BW (max):  {np.max(data['total']):.2f} GB/s")
             print(f"  Total BW (std):  {np.std(data['total']):.2f} GB/s")
+            if 'cpu' in data:
+                print(f"  CPU (avg):       {np.mean(data['cpu']):.1f} %")
+                print(f"  CPU (max):       {np.max(data['cpu']):.1f} %")
+            if 'io_read' in data:
+                print(f"  IO Read (avg):   {np.mean(data['io_read']):.1f} MB/s")
+                print(f"  IO Read (max):   {np.max(data['io_read']):.1f} MB/s")
+                print(f"  IO Write (avg):  {np.mean(data['io_write']):.1f} MB/s")
+                print(f"  IO Write (max):  {np.max(data['io_write']):.1f} MB/s")
         
         print("="*80)
     
