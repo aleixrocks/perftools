@@ -56,6 +56,10 @@ class MemoryBandwidthMonitor:
         self.write_event = None
         self.events_detected = False
 
+        # Cache whole-disk names for I/O monitoring
+        if monitor_io:
+            self._whole_disks = self._get_whole_disks()
+
         
     def check_perf_availability(self):
         """Check if perf is available"""
@@ -302,11 +306,19 @@ class MemoryBandwidthMonitor:
         return total - idle, total
 
     @staticmethod
-    def _read_io_stats():
+    def _get_whole_disks():
+        """Return set of whole-disk device names from /sys/block/."""
+        import os
+        try:
+            return set(os.listdir('/sys/block'))
+        except OSError:
+            return set()
+
+    def _read_io_stats(self):
         """Read aggregate disk I/O from /proc/diskstats. Returns (sectors_read, sectors_written).
 
-        Only counts whole-disk devices (no partition numbers) to avoid double-counting.
-        Sector size is 512 bytes.
+        Only counts whole-disk devices (listed in /sys/block/) to avoid
+        double-counting partitions. Sector size is 512 bytes.
         """
         sectors_read = 0
         sectors_written = 0
@@ -316,27 +328,8 @@ class MemoryBandwidthMonitor:
                 if len(parts) < 14:
                     continue
                 dev_name = parts[2]
-                # Skip partitions (names ending with a digit preceded by a letter,
-                # like sda1, nvme0n1p1). Keep whole disks like sda, nvme0n1.
-                # A simple heuristic: skip if last char is digit AND second-to-last
-                # is also digit or 'p' (partition indicator for nvme).
-                # More reliable: only count devices that have 0 in field 0 (minor) — no,
-                # let's just skip entries whose name matches common partition patterns.
-                # Simplest correct approach: skip if name ends with a digit and contains
-                # a 'p' partition separator or the preceding char is a letter.
-                if len(dev_name) > 1 and dev_name[-1].isdigit():
-                    # Check for nvme partition: nvme0n1p1
-                    if 'p' in dev_name and dev_name[-1].isdigit():
-                        idx = dev_name.rfind('p')
-                        if idx > 0 and dev_name[idx+1:].isdigit():
-                            continue
-                    # Check for sd/hd/vd partition: sda1
-                    elif dev_name[-1].isdigit() and len(dev_name) >= 4:
-                        prefix = dev_name.rstrip('0123456789')
-                        if prefix != dev_name:  # has trailing digits
-                            # If prefix ends with a letter, it's a partition
-                            if prefix and prefix[-1].isalpha():
-                                continue
+                if dev_name not in self._whole_disks:
+                    continue
                 sectors_read += int(parts[5])    # sectors read
                 sectors_written += int(parts[9]) # sectors written
         return sectors_read, sectors_written
